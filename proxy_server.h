@@ -15,6 +15,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <openssl/ssl.h>
+#include "stats.h"
 
 #define MAX_WORKERS 10
 #define MAX_CONNECTIONS 100
@@ -54,6 +55,7 @@ typedef struct proxyServerConfig {
 // Main proxy server structure
 typedef struct proxyServer {
     int server_socket;
+    int udp_socket; // For HTTP/3 (QUIC)
     struct sockaddr_in server_addr;
     bool is_running;
     SSL_CTX *ssl_ctx;
@@ -63,6 +65,7 @@ typedef struct proxyServer {
     threadPool_t *thread_pool;
     proxyServerConfig_t config;
     pthread_mutex_t server_mutex;
+    stats_manager_t *stats;
 } proxyServer_t;
 
 // Client connection structure
@@ -89,7 +92,7 @@ typedef struct {
 // Function prototypes
 
 // Server initialization and management
-proxyServer_t* proxy_server_create(const char* host, int port);
+proxyServer_t* proxy_server_create(proxyServerConfig_t *config);
 void proxy_server_destroy(proxyServer_t* server);
 int proxy_server_start(proxyServer_t* server);
 void proxy_server_stop(proxyServer_t* server);

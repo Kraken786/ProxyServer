@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include "proxy_server.h"
@@ -16,7 +17,7 @@
 #define PORT 8080
 
 // Add this global variable at the top of the file after includes
-static proxyServer_t *global_server = NULL;
+proxyServer_t *global_server = NULL;
 
 // Function to free client data stored in queue
 static void free_client_data(void *data)
@@ -42,9 +43,9 @@ static void print_client_data(void *data)
 }
 
 // Initialize the proxy server
-proxyServer_t *proxy_server_create(const char *host, int port)
+proxyServer_t *proxy_server_create(proxyServerConfig_t *config)
 {
-    LOG_DEBUG("Creating proxy server with host: %s, port: %d", host, port);
+    LOG_DEBUG("Creating proxy server with host: %s, port: %d", config->host, config->port);
 
     proxyServer_t *server = (proxyServer_t *)malloc(sizeof(proxyServer_t));
     if (!server)
@@ -57,7 +58,7 @@ proxyServer_t *proxy_server_create(const char *host, int port)
     memset(server, 0, sizeof(proxyServer_t));
 
     // Initialize all fields BEFORE creating thread pool
-    server->config.host = strdup(host);
+    server->config.host = strdup(config->host);
     if (!server->config.host)
     {
         LOG_ERROR("Failed to allocate host string");
@@ -65,13 +66,13 @@ proxyServer_t *proxy_server_create(const char *host, int port)
         return NULL;
     }
 
-    server->config.port = port;
-    server->config.max_workers = MAX_WORKERS;
-    server->config.max_connections = MAX_CONNECTIONS;  // Set this before queue creation
+    server->config.port = config->port;
+    server->config.max_workers = config->max_workers;
+    server->config.max_connections = config->max_connections;
     server->is_running = true;
 
     // Initialize connection queue first
-    LOG_DEBUG("Creating connection queue");
+    LOG_DEBUG("Creating connection queue with size: %d", server->config.max_connections);
     server->connection_queue = create_queue(server->config.max_connections, free_client_data, print_client_data);
     if (!server->connection_queue)
     {
@@ -85,6 +86,19 @@ proxyServer_t *proxy_server_create(const char *host, int port)
     if (pthread_mutex_init(&server->server_mutex, NULL) != 0)
     {
         LOG_ERROR("Failed to initialize server mutex");
+        delete_queue(server->connection_queue);
+        thread_pool_destroy(server->thread_pool);
+        free(server->config.host);
+        free(server);
+        return NULL;
+    }
+
+    // Initialize stats manager
+    server->stats = stats_manager_create();
+    if (!server->stats)
+    {
+        LOG_ERROR("Failed to create stats manager");
+        pthread_mutex_destroy(&server->server_mutex);
         delete_queue(server->connection_queue);
         thread_pool_destroy(server->thread_pool);
         free(server->config.host);
@@ -270,6 +284,36 @@ void *worker_thread_function(void *arg)
     return NULL;
 }
 
+// UDP Listener Thread for HTTP/3 (QUIC)
+static void *udp_listener_thread(void *arg) {
+    proxyServer_t *server = (proxyServer_t *)arg;
+    char buffer[4096];
+    struct sockaddr_in client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+
+    LOG_INFO("UDP Listener started for HTTP/3 (QUIC) detection");
+
+    while (server->is_running) {
+        ssize_t received = recvfrom(server->udp_socket, buffer, sizeof(buffer), 0,
+                                    (struct sockaddr *)&client_addr, &addr_len);
+        if (received > 0) {
+            char client_ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+            
+            // Log stats for QUIC packet
+            if (server->stats) {
+                stats_record_visit(server->stats, "UDP Packet (QUIC/HTTP3)", client_ip, "HTTP/3 (QUIC)", "Unknown");
+            }
+            
+            LOG_DEBUG("Received UDP packet from %s:%d (Length: %ld)", client_ip, ntohs(client_addr.sin_port), received);
+            
+            // Since we can't parse QUIC without keys/library, we just drop it or echo it?
+            // Dropping is safer.
+        }
+    }
+    return NULL;
+}
+
 // Add new function to create a client
 proxyClient_t *create_client(void)
 {
@@ -302,6 +346,34 @@ int proxy_server_start(proxyServer_t *server)
     if (server->server_socket < 0)
     {
         return -1;
+    }
+
+    // Initialize UDP socket for HTTP/3
+    server->udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    if (server->udp_socket >= 0) {
+        struct sockaddr_in udp_addr;
+        memset(&udp_addr, 0, sizeof(udp_addr));
+        udp_addr.sin_family = AF_INET;
+        udp_addr.sin_port = htons(server->config.port); // Same port as TCP
+        udp_addr.sin_addr.s_addr = inet_addr(server->config.host);
+        
+        if (bind(server->udp_socket, (struct sockaddr *)&udp_addr, sizeof(udp_addr)) < 0) {
+            LOG_ERROR("Failed to bind UDP socket: %s", strerror(errno));
+            close(server->udp_socket);
+            server->udp_socket = -1;
+        } else {
+            LOG_INFO("UDP Listener (HTTP/3) listening on %s:%d", server->config.host, server->config.port);
+            
+            // Start UDP thread
+            pthread_t udp_tid;
+            if (pthread_create(&udp_tid, NULL, udp_listener_thread, server) == 0) {
+                pthread_detach(udp_tid);
+            } else {
+                LOG_ERROR("Failed to create UDP thread");
+            }
+        }
+    } else {
+        LOG_ERROR("Failed to create UDP socket");
     }
 
     LOG_INFO("Server listening on %s:%d", server->config.host, server->config.port);
@@ -362,9 +434,13 @@ void proxy_server_destroy(proxyServer_t *server)
     }
 
     close(server->server_socket);
+    if (server->udp_socket >= 0) {
+        close(server->udp_socket);
+    }
     thread_pool_destroy(server->thread_pool);
     delete_queue(server->connection_queue);
     pthread_mutex_destroy(&server->server_mutex);
+    stats_manager_destroy(server->stats);
     free(server->config.host);
 
     if (server->ssl_ctx)
@@ -460,14 +536,45 @@ void handle_client_connection(proxyClient_t *client)
     }
     buffer[bytes_read] = '\0';
 
+#include "http2_handler.h"
+
     // Parse the request
     if (sscanf(buffer, "%15s %2047s %15s", method, url, protocol) != 3)
     {
+        // Check for HTTP/2 Connection Preface
+        if (strncmp(buffer, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 24) == 0) {
+            LOG_INFO("Received HTTP/2 Connection Preface");
+            handle_http2_connection(client, buffer, bytes_read);
+            return;
+        }
+
         LOG_ERROR("Failed to parse request: %.*s", (int)bytes_read, buffer);
         return;
     }
 
     LOG_DEBUG("Received request: %s %s %s", method, url, protocol);
+
+    // Extract User-Agent
+    char *user_agent = NULL;
+    char *ua_start = strstr(buffer, "User-Agent: ");
+    if (ua_start) {
+        ua_start += 12; // Skip "User-Agent: "
+        char *ua_end = strstr(ua_start, "\r\n");
+        if (ua_end) {
+            size_t ua_len = ua_end - ua_start;
+            user_agent = malloc(ua_len + 1);
+            if (user_agent) {
+                strncpy(user_agent, ua_start, ua_len);
+                user_agent[ua_len] = '\0';
+            }
+        }
+    }
+
+    if (global_server && global_server->stats) {
+        stats_record_visit(global_server->stats, url, client->peer_ip, protocol, user_agent);
+    }
+    
+    if (user_agent) free(user_agent);
 
 #if 1
     // Handle CONNECT method differently
@@ -729,6 +836,19 @@ int connect_to_remote(proxyClient_t *client, char *host, int port)
     return remote_socket;
 }
 
+// Helper to send all data
+ssize_t send_all(int socket, const char *buffer, size_t length) {
+    size_t total_sent = 0;
+    while (total_sent < length) {
+        ssize_t sent = send(socket, buffer + total_sent, length - total_sent, 0);
+        if (sent <= 0) return sent;
+        total_sent += sent;
+    }
+    return total_sent;
+}
+
+#include "tls_parser.h"
+
 // Tunnel data between client and remote server
 void tunnel_data(proxyClient_t *client, int remote_socket)
 {
@@ -736,6 +856,7 @@ void tunnel_data(proxyClient_t *client, int remote_socket)
     char buffer[BUFFER_SIZE];
     int client_socket = client->client_socket;
     int max_fd = (client_socket > remote_socket ? client_socket : remote_socket) + 1;
+    bool first_packet = true;
 
     while (1)
     {
@@ -760,6 +881,23 @@ void tunnel_data(proxyClient_t *client, int remote_socket)
             if (bytes_read <= 0)
                 break;
 
+            // Check for TLS Client Hello and ALPN h2
+            if (first_packet && !client->is_https) { // Only check for blind tunnels (CONNECT)
+                if (check_tls_alpn_h2((uint8_t*)buffer, bytes_read)) {
+                    LOG_INFO("Detected HTTP/2 (h2) in TLS Client Hello");
+                    if (global_server && global_server->stats) {
+                        // We need to update the existing entry or add a new one.
+                        // stats_record_visit adds a new one if not found, or increments.
+                        // Since we already recorded "CONNECT ...", this might add a duplicate or update.
+                        // But we don't have the URL here easily (it was in handle_client_connection).
+                        // However, we can log it as a special event or try to update.
+                        // Let's just log it with the IP.
+                        stats_record_visit(global_server->stats, "HTTPS Tunnel (H2 Negotiated)", client->peer_ip, "HTTP/2.0 (Tunnel)", "Unknown");
+                    }
+                }
+                first_packet = false;
+            }
+
             ssize_t bytes_sent;
             if (client->is_https)
             {
@@ -767,7 +905,7 @@ void tunnel_data(proxyClient_t *client, int remote_socket)
             }
             else
             {
-                bytes_sent = send(remote_socket, buffer, bytes_read, 0);
+                bytes_sent = send_all(remote_socket, buffer, bytes_read);
             }
             if (bytes_sent <= 0)
                 break;
@@ -788,7 +926,7 @@ void tunnel_data(proxyClient_t *client, int remote_socket)
             if (bytes_read <= 0)
                 break;
 
-            if (send(client_socket, buffer, bytes_read, 0) <= 0)
+            if (send_all(client_socket, buffer, bytes_read) <= 0)
                 break;
         }
     }
@@ -919,6 +1057,13 @@ proxyClient_t *dequeue_client_connection(proxyServer_t *server)
 // Update the signal handler implementation
 void handle_signal(int sig)
 {
+    if (sig == SIGUSR1) {
+        if (global_server && global_server->stats) {
+            stats_print(global_server->stats);
+        }
+        return;
+    }
+
     printf("\nReceived signal %d, shutting down server...\n", sig);
 
     if (global_server)
@@ -975,13 +1120,94 @@ SSL_CTX *init_ssl_ctx(const char *cert_file, const char *key_file)
     return ctx;
 }
 
+#include "control.h"
+
+// Daemonize the process
+static void daemonize() {
+    pid_t pid;
+
+    // Fork off the parent process
+    pid = fork();
+
+    // An error occurred
+    if (pid < 0)
+        exit(EXIT_FAILURE);
+
+    // Success: Let the parent terminate
+    if (pid > 0)
+        exit(EXIT_SUCCESS);
+
+    // On success: The child process becomes session leader
+    if (setsid() < 0)
+        exit(EXIT_FAILURE);
+
+    // Catch, ignore and handle signals
+    signal(SIGCHLD, SIG_IGN);
+    signal(SIGHUP, SIG_IGN);
+
+    // Fork off for the second time
+    pid = fork();
+
+    // An error occurred
+    if (pid < 0)
+        exit(EXIT_FAILURE);
+
+    // Success: Let the parent terminate
+    if (pid > 0)
+        exit(EXIT_SUCCESS);
+
+    // Set new file permissions
+    umask(0);
+
+    // Change the working directory to the root directory
+    // or another appropriated directory
+    // chdir("/"); // Keeping current directory for now to keep log file in place
+
+    // Close all open file descriptors
+    int x;
+    for (x = sysconf(_SC_OPEN_MAX); x >= 0; x--)
+    {
+        close(x);
+    }
+
+    // Open the log file
+    // Re-initialize logging since we closed FDs
+    // Note: init_logging opens a file, so we need to make sure we don't close it immediately after
+    // But since we closed ALL FDs, we need to reopen stdin/out/err to /dev/null
+    
+    int fd0 = open("/dev/null", O_RDWR);
+    int fd1 = dup(0);
+    int fd2 = dup(0);
+    
+    (void)fd0; (void)fd1; (void)fd2; // Suppress unused warnings
+}
+
 // Update the main function to set the global server variable
-int main()
+int main(int argc, char *argv[])
 {
+    // Handle command line arguments
+    if (argc > 1) {
+        if (strcmp(argv[1], "status") == 0) {
+            return send_control_command("STATUS");
+        } else if (strcmp(argv[1], "stats") == 0) {
+            return send_control_command("STATS");
+        } else if (strcmp(argv[1], "clear-stats") == 0) {
+            return send_control_command("CLEAR_STATS");
+        } else if (strcmp(argv[1], "stop") == 0) {
+            return send_control_command("STOP");
+        } else if (strcmp(argv[1], "start") != 0) {
+            printf("Usage: %s [start|status|stats|clear-stats|stop]\n", argv[0]);
+            return EXIT_FAILURE;
+        }
+    }
+
+    // Daemonize
+    daemonize();
+
     // Initialize logging first
     if (!init_logging("proxy_server.log"))
     {
-        fprintf(stderr, "Failed to initialize logging\n");
+        // Can't print to stderr since we daemonized and closed it
         return EXIT_FAILURE;
     }
 
@@ -989,28 +1215,62 @@ int main()
     LOG_DEBUG("Starting proxy server initialization");
 
     // Set up signal handling
+    signal(SIGPIPE, SIG_IGN); // Ignore SIGPIPE to prevent crash on broken pipe
     if (signal(SIGINT, handle_signal) == SIG_ERR ||
-        signal(SIGTERM, handle_signal) == SIG_ERR)
+        signal(SIGTERM, handle_signal) == SIG_ERR ||
+        signal(SIGUSR1, handle_signal) == SIG_ERR)
     {
         LOG_ERROR("Failed to set up signal handlers");
         cleanup_logging();
         return EXIT_FAILURE;
     }
 
+#include "config.h"
+
+    // Initialize OpenSSL globally
+    SSL_library_init();
+    OpenSSL_add_all_algorithms();
+    SSL_load_error_strings();
+
+    // Load configuration
+    proxyServerConfig_t config = {0};
+    // Set defaults
+    config.port = PORT;
+    config.host = strdup("0.0.0.0");
+    config.max_workers = MAX_WORKERS;
+    config.max_connections = MAX_CONNECTIONS;
+
+    if (load_config(".env", &config) == 0) {
+        LOG_INFO("Loaded configuration from .env");
+    } else {
+        LOG_WARNING("Failed to load .env, using defaults");
+    }
+
     // Create proxy server with careful error checking
     proxyServer_t *proxy_server = NULL;
     LOG_DEBUG("Creating proxy server instance");
 
-    proxy_server = proxy_server_create("0.0.0.0", PORT);
+    proxy_server = proxy_server_create(&config);
     if (!proxy_server)
     {
         LOG_ERROR("Failed to create proxy server");
+        free(config.host);
         cleanup_logging();
         return EXIT_FAILURE;
     }
+    
+    free(config.host); // We don't need this copy anymore as create makes its own copy
 
     LOG_DEBUG("Proxy server created successfully");
     global_server = proxy_server;
+
+    // Start control server
+    if (start_control_server(proxy_server) != 0) {
+        LOG_ERROR("Failed to start control server");
+        proxy_server_destroy(proxy_server);
+        cleanup_logging();
+        return EXIT_FAILURE;
+    }
 
     // Start the server with error checking
     LOG_DEBUG("Starting proxy server");
